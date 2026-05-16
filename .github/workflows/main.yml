@@ -1,0 +1,166 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Install Python and Dependencies
+        run: |
+          Write-Host "Menginstal Python 3.11..."
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.11.5/python-3.11.5-amd64.exe" -OutFile "$env:TEMP\python-installer.exe"
+          Start-Process "$env:TEMP\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+          python --version
+          pip install --upgrade pip
+          
+          Write-Host "Membuat requirements.txt..."
+          @'
+          playwright
+          playwright-stealth
+          requests[socks]
+          free-proxy
+          beautifulsoup4
+          lxml
+          python-dotenv
+          unidecode
+          Faker
+          fp
+          tqdm
+          charset-normalizer
+          '@ | Out-File -FilePath requirements.txt -Encoding utf8
+
+          Write-Host "Menginstal semua dependencies..."
+          pip install -r requirements.txt
+          
+          Write-Host "Menginstal browser Playwright..."
+          playwright install
+
+          Write-Host "Instalasi Python & libraries selesai."
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Show External/Public IP (api.myip.com)
+        run: |
+          try {
+            Write-Host "Mencari public/outbound IP menggunakan api.myip.com..."
+            $myip = Invoke-RestMethod -Uri "https://api.myip.com" -UseBasicParsing -ErrorAction Stop
+            Write-Host "PUBLIC_IP_RAW: $($myip | ConvertTo-Json -Compress)"
+            Write-Host "PUBLIC_IP: $($myip.ip)"
+            echo "PUBLIC_IP=$($myip.ip)" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "Gagal mengambil public IP: $($_.Exception.Message)"
+          }
+
+      - name: Check growtopiagame.com/detail response
+        run: |
+          $url = "https://www.growtopiagame.com/detail"
+          Write-Host "Memeriksa $url ..."
+          try {
+            $resp = Invoke-WebRequest -Uri $url -Method GET -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            $status = $resp.StatusCode
+            $length = ($resp.Content).Length
+            $snippet = if ($length -gt 1000) { $resp.Content.Substring(0,1000) + "`n--- (truncated) ---" } else { $resp.Content }
+            Write-Host "HTTP StatusCode: $status"
+            Write-Host "Response Length: $length"
+            Write-Host "=== Growtopia Response Snippet ==="
+            Write-Host $snippet
+            echo "GROWTOPIA_STATUS=$status" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "Request gagal: $($_.Exception.Message)"
+            if ($_.Exception.Response -ne $null) {
+              $code = $_.Exception.Response.StatusCode.value__
+              Write-Host "Response code dari server: $code"
+              echo "GROWTOPIA_STATUS=$code" >> $env:GITHUB_ENV
+            }
+          }
+
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Tailscale Address: $env:TAILSCALE_IP"
+          Write-Host "Public IP: $env:PUBLIC_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
